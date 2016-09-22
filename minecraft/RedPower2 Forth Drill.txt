@@ -1,0 +1,129 @@
+\ If it doesn't seem to work, it's probably because I never took in to consideration the substantial amount of power necessary
+\ for the frame motors to move so many blocks. Look in to this before trying again.
+
+\ Eric Mitchem
+\ May 2, 2013
+\ Minecraft RP2 Drill (Forth)
+
+\ Delay times
+10 CONSTANT Short
+20 CONSTANT Standard
+30 CONSTANT Long
+40 CONSTANT Extreme
+
+\ IOX movement directions
+1 CONSTANT South
+2 CONSTANT North
+4 CONSTANT East
+8 CONSTANT West
+16 CONSTANT Up
+32 CONSTANT Down
+
+\ Last movement direction
+VARIABLE MovementDirection
+
+\ Height at which the drill is at rest.
+VARIABLE DrillRestPos
+5 CONSTANT Bedrock
+
+\ 20 ticks = 1 sec
+: Delay ( n -- )
+	TICKS
+	;
+
+: BaseMove ( Amount Direction -- )
+	MovementDirection !
+	0 ?DO
+		MovementDirection @ DUP
+		IOXSET
+		Extreme Delay \ This delay has to be large. When the frame motor is moved, it seems to lose its charge.
+					  \ The time it takes to regain enough power doesn't seem to be determinate. So, we make
+					  \ this delay extra large to ensure it has enough time to recharge.
+		IOXRST
+		64 IOXSET \ Trigger frame motor for movement in any given direction.
+		Long Delay
+		64 IOXRST
+		Short Delay
+	LOOP
+	;
+
+: VerticalMove ( Amount Direction -- )
+	OVER SWAP
+	BaseMove
+	DrillRestPos DUP @
+	ROT
+	MovementDirection @ Up =
+	IF
+		+
+	ELSE
+		-
+	THEN
+	SWAP !
+	;
+	
+: Move ( Amount Direction -- )
+	DUP 8 >
+	IF
+		VerticalMove
+	ELSE
+		BaseMove
+	THEN
+	;
+		
+\ Deploy a frame in preparation of lowering the drill.
+: DeployFrame ( -- )
+	512 IOXSET
+	Short Delay
+	512 IOXRST
+	Short Delay
+	;
+	
+\ Break a frame in preparation of raising the drill.
+: BreakFrame ( -- )
+	1024 IOXSET
+	Short Delay
+	1024 IOXRST
+	Short Delay
+	;
+	
+: LowerDrill ( Amount -- )
+	0 ?DO
+		DeployFrame
+		128 IOXSET
+		Standard Delay
+		128 IOXRST
+		Short Delay
+	LOOP
+	;
+	
+: RaiseDrill ( Amount -- )
+	0 ?DO
+		256 IOXSET
+		Standard Delay
+		256 IOXRST
+		Short Delay
+		BreakFrame
+	LOOP
+	;
+	
+: ActivateDrill ( -- )
+	2048 IOXSET
+	Short Delay
+	2048 IOXRST
+	Short Delay
+	;
+	
+: Drill ( Depth -- )
+	DUP
+	0 ?DO
+		1 LowerDrill
+		ActivateDrill
+	LOOP
+	RaiseDrill
+	;
+	
+\ Uses depth heuristics (not guaranteed to be 100% correct).
+: SmartDrill ( -- )
+	DrillRestPos @ Bedrock -
+	Drill
+	;
