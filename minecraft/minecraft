@@ -1,0 +1,681 @@
+#!/bin/bash
+# TODO: Handle signals
+# TODO: Monitor needs i/o redirection
+# TODO: Monitor needs busy loop timeout
+
+###############################################################################
+# START CORE
+###############################################################################
+
+core_requires_user_error="Requires user"
+core_requires_command_error="Requires command"
+core_requires_root_error="Requires root"
+core_requires_pattern_error="Requires grep pattern"
+
+# $1 : Variable
+is_null()
+{
+	[ -z $1 ]
+}
+
+# $1 : Directory
+dir_exists()
+{
+	[ -d "$1" ];
+}
+
+# $1  : Warning
+# $2? : Interactive
+# $3? : Depth
+warn()
+{
+	local prefix="$0"
+	local depth=0
+	
+	if ! is_null $3; then
+		depth=$3
+	fi
+	
+	if [ ${FUNCNAME[1]} != "main" ]; then
+		prefix+=":${FUNCNAME[$(($depth + 1))]}"
+	fi
+	
+	prefix+=":${BASH_LINENO[$depth]}"
+	
+	echo "$prefix: $1"
+	
+	if ! is_null $2; then
+		read -ep "Press enter to continue"
+	fi
+}
+
+# $1 : Error
+error()
+{
+	local prefix="$0"
+	
+	echo ${prefix}:${FUNCNAME[0]}: "$1" >&2
+	
+	local i=1
+	local indent="\x20"
+	
+	while [ ${FUNCNAME[$i]} != "main" ]; do
+		echo -e ${indent}${prefix}:${FUNCNAME[$i]}:${BASH_LINENO[$(($i - 1))]} >&2
+		i=$(($i + 1))
+		indent+="\x20"
+	done
+	
+	echo -e ${indent}${prefix}:${BASH_LINENO[$(($i - 1))]} >&2
+	return 1
+}
+
+# $1 : Error
+fatal_error()
+{
+	local prefix="$0"
+	
+	echo ${prefix}:${FUNCNAME[0]}: "$1" >&2
+	
+	local i=1
+	local indent="\x20"
+	
+	while [ ${FUNCNAME[$i]} != "main" ]; do
+		echo -e ${indent}${prefix}:${FUNCNAME[$i]}:${BASH_LINENO[$(($i - 1))]} >&2
+		i=$(($i + 1))
+		indent+="\x20"
+	done
+	
+	echo -e ${indent}${prefix}:${BASH_LINENO[$(($i - 1))]} >&2
+	exit 1
+}
+
+# $1 : Variable
+# $2 : Error
+assert()
+{
+	# Unset variable expands to nothing. Thus, Error becomes $1.
+	if [ $# -lt 2 ]; then
+		fatal_error "$1"
+	fi
+
+	if is_null $1; then
+		fatal_error "$2"
+	fi
+}
+
+# $1   : User
+# $2   : Command
+# $3.. : Arguments
+as_user()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$core_requires_command_error"
+	sudo -u "$@"
+}
+
+require_root()
+{
+	if [ $(id -u) -ne 0 ]; then
+		fatal_error "$core_requires_root_error"
+	fi
+}
+
+# $1 : User
+# $2 : Pattern
+has_process()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$core_requires_pattern_error"
+	ps -u "$1" -o args | grep "$2" | fgrep -v "grep" &>/dev/null
+}
+
+###############################################################################
+# FINISH CORE
+###############################################################################
+
+###############################################################################
+# START TMUX
+###############################################################################
+
+tmux_requires_session_error="Requires tmux session"
+tmux_already_exists_error="tmux session already exists"
+tmux_doesnt_exist_error="tmux session doesn't exist"
+tmux_requires_keys_error="Requires keys to send"
+
+# $1 : User
+# $2 : Session
+tmux_has_session()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$tmux_requires_session_error"
+	as_user "$1" tmux has -t "$2" &>/dev/null
+}
+
+# $1 : User
+# $2 : Session
+tmux_start_session()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$tmux_requires_session_error"
+	
+	if tmux_has_session "$1" "$2"; then
+		error "$tmux_already_exists_error"
+		return
+	fi
+	
+	as_user "$1" tmux new -ds "$2" &>/dev/null
+}
+
+# $1 : User
+# $2 : Session
+tmux_attach_to_session()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$tmux_requires_session_error"
+	
+	if ! tmux_has_session "$1" "$2"; then
+		error "$tmux_doesnt_exist_error"
+		return
+	fi
+	
+	as_user "$1" tmux attach -t "$2" &>/dev/null
+}
+
+# $1	: User
+# $2 	: Session
+# $3 .. : Keys
+tmux_send_keys()
+{	
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$tmux_requires_session_error"
+	
+	if [ $# -lt 3 ]; then
+		fatal_error "$tmux_requires_keys_error"
+	fi
+	
+	if ! tmux_has_session "$1" "$2"; then
+		error "$tmux_doesnt_exist_error"
+		return
+	fi
+	
+	local panes=$(as_user "$1" tmux lsp -st "$2" 2>/dev/null)
+	local curr_pane=
+	local min_pane=2147483647
+	
+	while read -r line; do
+		curr_pane=$(echo "$line" | cut -d ' ' -f 7 | tr -cd [:digit:])
+		min_pane=$((curr_pane < min_pane ? curr_pane : min_pane))
+	done <<< "$panes"
+	
+	local main_pane="%${min_pane}"
+	local user="$1"
+	
+	shift 2
+	as_user "$user" tmux send -t $main_pane "$@" &>/dev/null
+}
+
+# $1 : User
+# $2 : Session
+tmux_stop_session()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$tmux_requires_session_error"
+	
+	if ! tmux_has_session "$1" "$2"; then
+		error "$tmux_doesnt_exist_error"
+		return
+	fi
+	
+	as_user "$1" tmux kill-session -t "$2" &>/dev/null
+}
+
+###############################################################################
+# FINISH TMUX
+###############################################################################
+
+###############################################################################
+# START RAM DISK
+###############################################################################
+
+ram_disk_requires_mount_path_error="Requires mount path"
+ram_disk_requires_target_path_error="Requires target path"
+ram_disk_requires_mount_size_error="Requires mount size in MB"
+ram_disk_path_doesnt_exist_error="Target path doesn't exist"
+ram_disk_already_mounted_error="Ram disk is already mounted"
+ram_disk_path_unknown_size_error="Failed to determine the size of the target path"
+ram_disk_path_too_large_error="Target path is too large to load in to ram disk"
+ram_disk_mount_path_make_error="Failed to make the mount path"
+ram_disk_mount_failed_error="Failed to mount the ram disk"
+ram_disk_load_failed_error="Failed to load the ram disk"
+ram_disk_isnt_mounted_error="Ram disk isn't mounted"
+ram_disk_unmount_failed_error="Failed to unmount the ram disk"
+ram_disk_mount_path_remove_error="Failed to remove the mount path"
+
+ram_disk_almost_full_warning="Ram disk is above 90% capacity"
+
+# $1 : Mount path
+ram_disk_is_mounted()
+{
+	assert "$1" "$ram_disk_requires_mount_path_error"
+	mount -lt tmpfs | fgrep "$1" &>/dev/null
+}
+
+# $1 : Target path
+# $2 : Mount path
+# $3 : Ram disk size in MB
+ram_disk_start()
+{
+	require_root
+
+	assert "$1" "$ram_disk_requires_target_path_error"
+	assert "$2" "$ram_disk_requires_mount_path_error"
+	assert "$3" "$ram_disk_requires_mount_size_error"
+	
+	if ! dir_exists "$1"; then
+		error "$ram_disk_path_doesnt_exist_error"
+		return
+	fi
+	
+	if ram_disk_is_mounted "$2"; then
+		error "$ram_disk_already_mounted_error"
+		return
+	fi
+	
+	local target_path_size=$(du -Lsm "$1" | cut -f 1 2>/dev/null)
+	
+	if is_null $target_path_size; then
+		error "$ram_disk_path_unknown_size_error"
+		return
+	elif [ $target_path_size -ge $3 ]; then
+		error "$ram_disk_path_too_large_error"
+		return
+	elif [ $target_path_size -gt $(($3 / 10 * 9)) ]; then
+		warn "$ram_disk_almost_full_warning" interactive
+	fi
+	
+	if ! dir_exists "$2"; then
+		if ! mkdir "$2" &>/dev/null; then
+			error "$ram_disk_mount_path_make_error"
+			return
+		fi
+	fi
+	
+	local mount_opts="-t tmpfs -o defaults,size=${3}m"
+	
+	if ! mount $mount_opts tmpfs "$2" &>/dev/null; then
+		error "$ram_disk_mount_failed_error"
+		return
+	fi
+	
+	if ! cp -a "$1"/* "$2" &>/dev/null; then
+		error "$ram_disk_load_failed_error"
+		return
+	fi
+}
+
+# $1 : Mount path
+ram_disk_stop()
+{
+	require_root
+
+	assert "$1" "$ram_disk_requires_mount_path_error"
+
+	if ! ram_disk_is_mounted "$1"; then
+		error "$ram_disk_isnt_mounted_error"
+		return
+	fi
+	
+	if ! umount "$1" &>/dev/null; then
+		error "$ram_disk_unmount_failed_error"
+		return
+	fi
+	
+	if ! rmdir "$1" &>/dev/null; then
+		error "$ram_disk_mount_path_remove_error"
+		return
+	fi
+}
+
+###############################################################################
+# FINISH RAM DISK
+###############################################################################
+
+###############################################################################
+# START SERVER
+###############################################################################
+
+server_requires_pattern_error="Requires server process args pattern"
+server_already_running_error="Server is already running"
+server_requires_minecraft_path_error="Requires minecraft path"
+server_link_target_error="Failed to link world path to mount path"
+server_requires_server_command_error="Requires server command"
+server_isnt_running_error="Server isn't running"
+server_unknown_uptime_error="Failed to determine server uptime"
+server_requires_minimum_uptime_error="Requires minimum uptime"
+server_unknown_canon_world_error="Failed to determine canon Minecraft world"
+server_save_copy_error="Failed to copy from ram disk"
+server_save_update_error="Failed to update the canon world"
+server_requires_save_frequency_error="Requires save frequency in seconds"
+server_link_remove_error="Failed to remove link from world path to mount path"
+
+server_minimum_uptime_warning="Attempted to save before reaching minimum uptime"
+
+# $1 : User
+# $2 : Server process args pattern
+server_is_running()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$server_requires_pattern_error"
+	has_process "$1" "$2"
+}
+
+# $1 : User
+# $2 : Minecraft path
+# $3 : Mount path
+# $4 : tmux session
+# $5 : Server command
+# $6 : Server process args pattern
+server_start()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$server_requires_minecraft_path_error"
+	assert "$3" "$ram_disk_requires_mount_path_error"
+	assert "$4" "$tmux_requires_session_error"
+	assert "$5" "$server_requires_server_command_error"
+	assert "$6" "$server_requires_pattern_error"
+	
+	local user="$1"
+	local minecraft_path="$2"
+	local mount_path="$3"
+	local tmux_session="$4"
+	local server_command="$5"
+	local pattern="$6"
+	
+	if ! tmux_has_session "$user" "$tmux_session"; then
+		error "$tmux_doesnt_exist_error"
+		return
+	fi
+	
+	if ! ram_disk_is_mounted "$mount_path"; then
+		error "$ram_disk_isnt_mounted_error"
+		return
+	fi
+
+	if server_is_running "$user" "$pattern"; then
+		error "$server_already_running_error"
+		return
+	fi
+	
+	if ! as_user "$user" ln -s "$mount_path" "${minecraft_path}/world" &>/dev/null; then
+		error "$server_link_target_error"
+		return
+	fi
+	
+	tmux_send_keys "$user" "$tmux_session" "$server_command" Enter
+
+	( exec setsid $0 monitor ) &
+}
+
+# $1 : User
+# $2 : Minecraft path
+# $3 : Mount path
+# $4 : tmux session
+# $5 : Minimum uptime
+# $6 : Server process args pattern
+server_save()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$server_requires_minecraft_path_error"
+	assert "$3" "$ram_disk_requires_mount_path_error"
+	assert "$4" "$tmux_requires_session_error"
+	assert "$5" "$server_requires_minimum_uptime_error"
+	assert "$6" "$server_requires_pattern_error"
+	
+	local user="$1"
+	local minecraft_path="$2"
+	local mount_path="$3"
+	local tmux_session="$4"
+	local min_uptime="$5"
+	local pattern="$6"
+
+	if ! tmux_has_session "$user" "$tmux_session"; then
+		error "$tmux_doesnt_exist_error"
+		return
+	fi
+
+	if ! ram_disk_is_mounted "$mount_path"; then
+		error "$ram_disk_isnt_mounted_error"
+		return
+	fi
+	
+	if ! server_is_running "$user" "$pattern"; then
+		error "$server_isnt_running_error"
+		return
+	fi
+	
+	local uptime=$(ps -u "$user" -o etimes,args | grep "$pattern" | fgrep -v "grep" | tr -s [:blank:] | cut -d ' ' -f 2 2>/dev/null)
+	
+	if is_null $uptime; then
+		error "$server_unknown_uptime_error"
+		return
+	elif [ $uptime -lt $min_uptime ]; then
+		warn "$server_minimum_uptime_warning"
+		return 1
+	fi
+	
+	local save_link="${minecraft_path}/world.save"
+	local canon_world=$(readlink "$save_link" | tr -cd [:digit:] 2>/dev/null)
+	local new_world=
+	
+	if is_null $canon_world; then
+		error "$server_unknown_canon_world_error"
+		return
+	elif [ $canon_world -eq 1 ]; then
+		new_world="${minecraft_path}/world.save2"
+	elif [ $canon_world -eq 2 ]; then
+		new_world="${minecraft_path}/world.save1"
+	else
+		error "$server_unknown_canon_world_error"
+		return
+	fi
+	
+	tmux_send_keys "$user" "$tmux_session" "say Save sequence begins in 30 seconds.." Enter
+	sleep 30s
+	
+	tmux_send_keys "$user" "$tmux_session" "save-off" Enter
+	sleep 5s
+	
+	tmux_send_keys "$user" "$tmux_session" "save-all" Enter
+	sleep 5s
+	
+	if ! cp -au "$mount_path"/* "$new_world"; then
+		tmux_send_keys "$user" "$tmux_session" "save-on" Enter
+		tmux_send_keys "$user" "$tmux_session" "say Save aborted. Check logs." Enter
+		error "$server_save_copy_error"
+		return
+	fi
+	
+	local temp_link="${minecraft_path}/world.save.new"
+	
+	if ! ln -s "$new_world" "$temp_link" || ! mv -T "$temp_link" "$save_link"; then
+		tmux_send_keys "$user" "$tmux_session" "save-on" Enter
+		tmux_send_keys "$user" "$tmux_session" "say Save aborted. Check logs." Enter
+		error "$server_save_update_error"
+		return
+	fi
+	
+	tmux_send_keys "$user" "$tmux_session" "save-on" Enter
+	sleep 5s
+	
+	tmux_send_keys "$user" "$tmux_session" "say Save sequence finished" Enter
+}
+
+# $1 : User
+# $2 : Minecraft path
+# $3 : Mount path
+# $4 : tmux session
+# $5 : Minimum uptime
+# $6 : Save frequency in seconds
+# $7 : Server process args pattern
+server_monitor()
+{
+	assert "$1" "$core_requires_user_error"
+	assert "$2" "$server_requires_minecraft_path_error"
+	assert "$3" "$ram_disk_requires_mount_path_error"
+	assert "$4" "$tmux_requires_session_error"
+	assert "$5" "$server_requires_minimum_uptime_error"
+	assert "$6" "$server_requires_save_frequency_error"
+	assert "$7" "$server_requires_pattern_error"
+	
+	local user="$1"
+	local minecraft_path="$2"
+	local mount_path="$3"
+	local tmux_session="$4"
+	local min_uptime="$5"
+	local save_frequency="$6"
+	local pattern="$7"
+
+	if ! tmux_has_session "$user" "$tmux_session"; then
+		error "$tmux_doesnt_exist_error"
+		return
+	fi
+	
+	while ! server_is_running "$user" "$pattern"; do
+		sleep 1s
+	done
+	
+	SECONDS=0
+	
+	while server_is_running "$user" "$pattern"; do
+		if [ $SECONDS -ge $save_frequency ]; then
+			server_save "$user" "$minecraft_path" "$mount_path" "$tmux_session" "$min_uptime" "$pattern"
+			SECONDS=0
+		else
+			sleep 1s
+		fi
+	done
+	
+	if ! as_user "$user" rm "${minecraft_path}/world"; then
+		error "$server_link_remove_error"
+	fi
+}
+
+###############################################################################
+# FINISH SERVER
+###############################################################################
+
+###############################################################################
+# START CASES
+###############################################################################
+
+MC_SERVICE="minecraft"
+MC_USER=$(logname)
+MC_TMUX_SESSION="${MC_SERVICE}-${MC_USER}"
+MC_RAM_DISK_MOUNT_PATH="/mnt/${MC_SERVICE}-${MC_USER}"
+MC_RAM_DISK_SIZE_MB=1024
+MC_MINECRAFT_PATH="/home/${MC_USER}/.minecraft"
+MC_FORGE_JAR="${MC_MINECRAFT_PATH}/forge-1.10.2-12.18.1.2011-universal.jar"
+MC_FORGE_OPTS="nogui"
+MC_JAVA_HEAP_SIZE_MB=2048
+MC_JAVA_HEAP_MAX_SIZE_MB=2048
+MC_JAVA_HEAP_NURSERY_SIZE_MB=512
+MC_JAVA_HEAP_POLICY="-XX:-UseAdaptiveSizePolicy"
+MC_JAVA_GC="-XX:+UseConcMarkSweepGC"
+MC_JAVA_OPTS="\
+	-Xms${MC_JAVA_HEAP_SIZE_MB}M \
+	-Xmx${MC_JAVA_HEAP_MAX_SIZE_MB}M \
+	-Xmn${MC_JAVA_HEAP_NURSERY_SIZE_MB}M \
+	$MC_JAVA_HEAP_POLICY \
+	$MC_JAVA_GC"
+MC_SERVER_COMMAND="java $MC_JAVA_OPTS -jar $MC_FORGE_JAR $MC_FORGE_OPTS"
+MC_SAVE_FREQUENCY=1800
+MC_MINIMUM_SAVE_UPTIME=300
+MC_SERVER_PROCESS_PATTERN="$MC_FORGE_JAR"
+
+c_start()
+{
+	if ! tmux_start_session "$MC_USER" "$MC_TMUX_SESSION"; then
+		return 1
+	fi
+	
+	if ! ram_disk_start "${MC_MINECRAFT_PATH}/world.save" "$MC_RAM_DISK_MOUNT_PATH" $MC_RAM_DISK_SIZE_MB; then
+		tmux_stop_session "$MC_USER" "$MC_TMUX_SESSION"
+		return 1
+	fi
+	
+	if ! server_start "$MC_USER" "$MC_MINECRAFT_PATH" "$MC_RAM_DISK_MOUNT_PATH" "$MC_TMUX_SESSION" "$MC_SERVER_COMMAND" "$MC_SERVER_PROCESS_PATTERN"; then
+		ram_disk_stop "$MC_RAM_DISK_MOUNT_PATH"
+		tmux_stop_session "$MC_USER" "$MC_TMUX_SESSION"
+		return 1
+	fi
+	
+	tmux_attach_to_session "$MC_USER" "$MC_TMUX_SESSION"
+}
+
+c_monitor()
+{
+	server_monitor "$MC_USER" "$MC_MINECRAFT_PATH" "$MC_RAM_DISK_MOUNT_PATH" "$MC_TMUX_SESSION" "$MC_MINIMUM_SAVE_UPTIME" "$MC_SAVE_FREQUENCY" "$MC_SERVER_PROCESS_PATTERN"
+	ram_disk_stop "$MC_RAM_DISK_MOUNT_PATH"
+	tmux_stop_session "$MC_USER" "$MC_TMUX_SESSION"
+}
+
+c_attach()
+{
+	tmux_attach_to_session "$MC_USER" "$MC_TMUX_SESSION"
+}
+
+c_save()
+{
+	server_save "$MC_USER" "$MC_MINECRAFT_PATH" "$MC_RAM_DISK_MOUNT_PATH" "$MC_TMUX_SESSION" "$MC_MINIMUM_SAVE_UPTIME" "$MC_SERVER_PROCESS_PATTERN" 
+}
+
+c_status()
+{
+	if tmux_has_session "$MC_USER" "$MC_TMUX_SESSION"; then
+		echo "tmux session exists"
+	else
+		echo "tmux session doesn't exist"
+	fi
+
+	if ram_disk_is_mounted "$MC_RAM_DISK_MOUNT_PATH"; then
+		echo "Ram disk is mounted"
+	else
+		echo "Ram disk isn't mounted"
+	fi
+
+	if server_is_running "$MC_USER" "$MC_SERVER_PROCESS_PATTERN"; then
+		echo "Server is running"
+	else
+		echo "Server isn't running"
+	fi
+}
+
+c_usage()
+{
+	echo "Usage: [start|attach|save|status]"
+}
+
+###############################################################################
+# FINISH CASES
+###############################################################################
+
+case "$1" in
+	start)
+		c_start
+		;;
+	monitor)
+		c_monitor
+		;;
+	attach)
+		c_attach
+		;;
+	save)
+		c_save
+		;;
+	status)
+		c_status
+		;;
+	*)
+		c_usage
+		;;
+esac
