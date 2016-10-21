@@ -2,6 +2,7 @@
 # TODO: Handle signals
 # TODO: Monitor needs i/o redirection
 # TODO: Monitor needs busy loop timeout
+# TODO: Monitor needs serialization
 
 ###############################################################################
 # START CORE
@@ -413,7 +414,7 @@ server_start()
 	
 	tmux_send_keys "$user" "$tmux_session" "$server_command" Enter
 
-	( exec setsid $0 monitor ) &
+	( exec setsid "$0" monitor ) &
 }
 
 # $1 : User
